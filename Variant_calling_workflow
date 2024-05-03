@@ -1,0 +1,135 @@
+rule all:
+    input:
+        "output/combined_annotations.vcf",
+        "output/multiqc_report.html"
+
+rule quality_control:
+    input:
+        fastq1="sample_R1.fastq",
+        fastq2="sample_R2.fastq"
+    output:
+        qc_dir=temp(directory("output/qc"))
+    shell:
+        "fastqc {input.fastq1} {input.fastq2} -o {output.qc_dir}"
+
+rule multiqc:
+    input:
+        qc_dir="output/qc"
+    output:
+        report="output/multiqc_report.html"
+    shell:
+        "multiqc {input.qc_dir} -o {output.report}"
+
+rule trim_reads:
+    input:
+        fastq1="sample_R1.fastq",
+        fastq2="sample_R2.fastq"
+    output:
+        trimmed_r1="output/trimmed_R1.fastq",
+        trimmed_r2="output/trimmed_R2.fastq",
+        unpaired_r1="output/trimmed_unpaired_R1.fastq",
+        unpaired_r2="output/trimmed_unpaired_R2.fastq"
+    shell:
+        "trimmomatic PE {input.fastq1} {input.fastq2} {output.trimmed_r1} {output.unpaired_r1} {output.trimmed_r2} {output.unpaired_r2} SLIDINGWINDOW:4:20 MINLEN:36"
+
+rule align_reads:
+    input:
+        ref_genome="reference_genome.fa",
+        trimmed_r1="output/trimmed_R1.fastq",
+        trimmed_r2="output/trimmed_R2.fastq"
+    output:
+        aligned_sam="output/aligned_reads.sam"
+    threads: 8
+    shell:
+        "bwa mem -t {threads} {input.ref_genome} {input.trimmed_r1} {input.trimmed_r2} > {output.aligned_sam}"
+
+rule convert_sort_index_bam:
+    input:
+        aligned_sam="output/aligned_reads.sam"
+    output:
+        sorted_bam="output/sorted_reads.bam",
+        bam_index="output/sorted_reads.bam.bai"
+    shell:
+        """
+        samtools view -bS {input.aligned_sam} | samtools sort -o {output.sorted_bam}
+        samtools index {output.sorted_bam}
+        """
+
+rule mark_duplicates:
+    input:
+        sorted_bam="output/sorted_reads.bam"
+    output:
+        dedup_bam="output/dedup_reads.bam",
+        metrics="output/duplicate_metrics.txt"
+    shell:
+        "java -jar $PICARD MarkDuplicates I={input.sorted_bam} O={output.dedup_bam} M={output.metrics} REMOVE_DUPLICATES=true"
+
+rule base_recalibration:
+    input:
+        dedup_bam="output/dedup_reads.bam",
+        ref_genome="reference_genome.fa",
+        known_variants="known_variants.vcf"
+    output:
+        recal_table="output/recal_data.table",
+        recal_bam="output/recal_reads.bam"
+    shell:
+        """
+        gatk BaseRecalibrator -I {input.dedup_bam} -R {input.ref_genome} --known-sites {input.known_variants} -O {output.recal_table}
+        gatk ApplyBQSR -R {input.ref_genome} -I {input.dedup_bam} --bqsr-recal-file {output.recal_table} -O {output.recal_bam}
+        """
+
+rule variant_calling:
+    input:
+        ref_genome="reference_genome.fa",
+        recal_bam="output/recal_reads.bam"
+    output:
+        raw_variants="output/raw_variants.vcf"
+    shell:
+        "gatk HaplotypeCaller -R {input.ref_genome} -I {input.recal_bam} -O {output.raw_variants}"
+
+rule somatic_variant_calling:
+    input:
+        ref_genome="reference_genome.fa",
+        recal_bam="output/recal_reads.bam",
+        known_variants="known_variants.vcf"
+    output:
+        somatic_variants="output/somatic_variants.vcf"
+    shell:
+        "gatk Mutect2 -R {input.ref_genome} -I {input.recal_bam} -tumor sample_name --germline-resource {input.known_variants} -O {output.somatic_variants}"
+
+rule annotate_variants:
+    input:
+        raw_variants="output/raw_variants.vcf",
+        somatic_variants="output/somatic_variants.vcf"
+    output:
+        annotated_variants="output/annotated_variants.vcf",
+        annovar_output="output/annovar.hg19_multianno.vcf"
+    shell:
+        """
+        snpEff ann -v hg19 {input.raw_variants} > {output.annotated_variants}
+        table_annovar.pl {input.somatic_variants} humandb/ -buildver hg19 -out output/annovar -remove -protocol refGene,cytoBand,exac03,dbnsfp33a -operation g,r,f,f -nastring . -csvout -polish -xreffile example/gene_xref.txt
+        """
+
+rule predict_effects_REVEL:
+    input:
+        annotated_variants="output/annotated_variants.vcf"
+    output:
+        revel_output="output/revel_output.txt"
+    shell:
+        "revel --input {input.annotated_variants} --output {output.revel_output}"
+
+rule integrate_additional_databases:
+    input:
+        annovar_output="output/annovar.hg19_multianno.vcf"
+    output:
+        combined_annotations="output/combined_annotations.vcf"
+    shell:
+        """
+        annotate_variation.pl -filter -dbtype clinvar {input.annovar_output} humandb/ -build hg19
+        annotate_variation.pl -filter -dbtype cosmic70 {input.annovar_output} humandb/ -build hg19
+        combine_annotations.py {input.annovar_output} \
+                              output/annovar.hg19_multianno.exonic_variant_function \
+                              output/annovar.hg19_multianno.hg19_clinvar_dropped \
+                              output/annovar.hg19_multianno.hg19_cosmic70_dropped \
+                              -o {output.combined_annotations}
+        """
